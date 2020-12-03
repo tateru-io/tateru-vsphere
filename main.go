@@ -1,19 +1,40 @@
+// Deployment manager for vSphere, main program
+// Copyright (C) 2020  Christian Svensson
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-systemd/daemon"
+	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	//"github.com/vmware/govmomi"
-	"github.com/gorilla/mux"
+	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
@@ -21,6 +42,7 @@ import (
 
 var (
 	listenApi    = flag.String("listen-api", "[::]:7707", "Address and port (TCP) to listen for the manager API server")
+	timeoutFlag  = flag.String("timeout", "10s", "Timeout for operations talking to managed resources")
 	confFile     = flag.String("config", "manager.yml", "Configuration file to read endpoints from")
 	buildVersion = "unknown"
 
@@ -31,11 +53,13 @@ var (
 		},
 		[]string{"version"},
 	)
+	timeout time.Duration
 )
 
 type managerServer struct {
 	mu  sync.RWMutex
 	cfg *config
+	log *zap.Logger
 }
 
 type config struct {
@@ -43,6 +67,11 @@ type config struct {
 		Username string
 		Password string
 	}
+}
+
+type machine struct {
+	UUID string
+	Name string
 }
 
 func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +83,48 @@ func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
 func (s *managerServer) MachinesHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	http.Error(w, "Not implemented", http.StatusNotImplemented)
+	// TODO: Cache these and don't do them sequentially
+	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	var machs []machine
+	for host, opts := range s.cfg.Manager {
+		u := &url.URL{
+			Scheme: "https",
+			User:   url.UserPassword(opts.Username, opts.Password),
+			Host:   host,
+			Path:   "/sdk",
+		}
+		c, err := govmomi.NewClient(ctx, u /* insecure= */, false)
+		if err != nil {
+			s.log.Error("Failed to connect to vCenter host", zap.String("host", host), zap.Error(err))
+			continue
+		}
+		// Logout the connection when we are done but do it in the background
+		defer func() {
+			go c.Logout(context.Background())
+		}()
+		f := find.NewFinder(c.Client)
+		vms, err := f.VirtualMachineList(ctx, "/...")
+		if err != nil {
+			s.log.Error("Failed to list VMs", zap.String("host", host), zap.Error(err))
+			continue
+		}
+		for i := range vms {
+			vm := vms[i]
+			machs = append(machs, machine{
+				UUID: vm.UUID(ctx),
+				Name: vm.Name(),
+			})
+		}
+	}
+	js, err := json.Marshal(machs)
+	if err != nil {
+		s.log.Error("Failed to marshal Machines collection", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(js)
 }
 
 func init() {
@@ -77,10 +147,14 @@ func (s *managerServer) loadConfig(file string) error {
 }
 
 func main() {
+	var err error
 	flag.Parse()
-	mVersionInfo.With(prometheus.Labels{"version": buildVersion}).Inc()
+	timeout, err = time.ParseDuration(*timeoutFlag)
+	if err != nil {
+		panic(err)
+	}
 
-	var rootlog *zap.Logger
+	mVersionInfo.With(prometheus.Labels{"version": buildVersion}).Inc()
 	rootlog, err := zap.NewDevelopment()
 	if err != nil {
 		panic(err)
@@ -92,7 +166,7 @@ func main() {
 
 	rawlog.Info("vSphere deploy manager starting up")
 
-	srv := &managerServer{}
+	srv := &managerServer{log: rawlog}
 	if err := srv.loadConfig(*confFile); err != nil {
 		rawlog.Fatal("Failed to load configuration file", zap.String("file", *confFile), zap.Error(err))
 	}
