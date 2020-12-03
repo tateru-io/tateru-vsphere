@@ -1,0 +1,4 @@
+manager:
+        vc.corp.local:
+                username: some-api-user@vsphere.local
+                password: "some-secret-password"
