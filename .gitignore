@@ -1,1 +1,3 @@
 manager.yml
+.*.sw?
+deploy-manager-vsphere
