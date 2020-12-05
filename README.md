@@ -1,2 +1,3 @@
-# deploy-manager-vsphere
-Deployment manager for vSphere
+# Tateru manager for vSphere
+
+vSphere integration for Tateru deployment system
