@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,7 +53,28 @@ var (
 			Name: "deploy_manager_version_info",
 			Help: "Build information about the deploy manager server",
 		},
-		[]string{"version"},
+		[]string{"name", "version"},
+	)
+	mPollDuration = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "deploy_manager_poll_duration_seconds",
+			Help: "Duration taken to poll the targets in seconds",
+		},
+		[]string{"target"},
+	)
+	mPollSuccess = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "deploy_manager_poll_success",
+			Help: "Set to 1 if the poll of a target was successful",
+		},
+		[]string{"target"},
+	)
+	mMachines = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "deploy_manager_machines_total",
+			Help: "Number of machines known to the manager",
+		},
+		[]string{"target"},
 	)
 	timeout      time.Duration
 	pollInterval time.Duration
@@ -144,6 +166,8 @@ func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results
 	if err != nil {
 		s.log.Error("Failed to connect to vCenter host", zap.String("host", opts.Hostname), zap.Error(err))
 		results <- []machine{}
+		mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(0.0)
+		mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(math.NaN())
 		return
 	}
 	// Logout the connection when we are done but do it in the background
@@ -158,6 +182,8 @@ func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results
 	if err != nil {
 		s.log.Error("Failed to list VMs", zap.String("host", opts.Hostname), zap.Error(err))
 		results <- []machine{}
+		mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(0.0)
+		mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(math.NaN())
 		return
 	}
 	for i := range vms {
@@ -169,6 +195,9 @@ func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results
 	}
 	end := time.Now()
 
+	mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(1.0)
+	mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(end.Sub(start).Seconds())
+	mMachines.With(prometheus.Labels{"target": opts.Hostname}).Set(float64(len(machs)))
 	s.log.Debug("Poll worker complete", zap.String("host", opts.Hostname), zap.Duration("duration", end.Sub(start)), zap.Int("vm_count", len(machs)))
 	results <- machs
 }
@@ -187,8 +216,61 @@ func (s *managerServer) MachinesHandler(w http.ResponseWriter, r *http.Request) 
 	w.Write(js)
 }
 
+func (s *managerServer) SpecificMachineHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	uuid := vars["uuid"]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var m *machine
+	for _, x := range s.machs {
+		if x.UUID == uuid {
+			m = &x
+			break
+		}
+	}
+	if m == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	js, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		s.log.Error("Failed to marshal Machine object", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(js)
+}
+
+func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	uuid := vars["uuid"]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var m *machine
+	for _, x := range s.machs {
+		if x.UUID == uuid {
+			m = &x
+			break
+		}
+	}
+	if m == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// TODO: Add boot-installer (https://github.com/vmware/govmomi/blob/1bed5d199a3ad01fb42455993c432349dec99023/govc/device/boot.go#L64)
+
+	http.Error(w, "not implemented yet", http.StatusNotImplemented)
+}
+
 func init() {
 	prometheus.MustRegister(mVersionInfo)
+	prometheus.MustRegister(mPollDuration)
+	prometheus.MustRegister(mPollSuccess)
+	prometheus.MustRegister(mMachines)
 }
 
 func (s *managerServer) loadConfig(file string) error {
@@ -218,7 +300,7 @@ func main() {
 		panic(err)
 	}
 
-	mVersionInfo.With(prometheus.Labels{"version": buildVersion}).Inc()
+	mVersionInfo.With(prometheus.Labels{"name": "tateru-vsphere", "version": buildVersion}).Inc()
 	rootlog, err := zap.NewDevelopment()
 	if err != nil {
 		panic(err)
@@ -238,8 +320,9 @@ func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/", srv.StatusHandler).Methods("GET")
 	r.HandleFunc("/v1/machines", srv.MachinesHandler).Methods("GET")
+	r.HandleFunc("/v1/machines/{uuid}", srv.SpecificMachineHandler).Methods("GET")
+	r.HandleFunc("/v1/machines/{uuid}/boot-installer", srv.BootInstallerHandler).Methods("POST")
 	r.Handle("/metrics", promhttp.Handler())
-	// TODO: Add boot-installer (https://github.com/vmware/govmomi/blob/1bed5d199a3ad01fb42455993c432349dec99023/govc/device/boot.go#L64)
 
 	go func() {
 		if err := http.ListenAndServe(*listenApi, r); err != nil {
