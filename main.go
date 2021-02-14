@@ -43,6 +43,7 @@ import (
 var (
 	listenApi    = flag.String("listen-api", "[::]:7707", "Address and port (TCP) to listen for the manager API server")
 	timeoutFlag  = flag.String("timeout", "10s", "Timeout for operations talking to managed resources")
+	intervalFlag = flag.String("poll-interval", "30s", "Poll interval for machine database refreshes")
 	confFile     = flag.String("config", "manager.yml", "Configuration file to read endpoints from")
 	buildVersion = "unknown"
 
@@ -53,25 +54,31 @@ var (
 		},
 		[]string{"version"},
 	)
-	timeout time.Duration
+	timeout      time.Duration
+	pollInterval time.Duration
 )
 
 type managerServer struct {
-	mu  sync.RWMutex
-	cfg *config
-	log *zap.Logger
+	mu    sync.RWMutex
+	cfg   *config
+	log   *zap.Logger
+	machs []machine
 }
 
 type config struct {
-	Manager map[string]struct {
-		Username string
-		Password string
-	}
+	Targets []managerCfg
+}
+
+type managerCfg struct {
+	Hostname string
+	Username string
+	Password string
+	Insecure bool
 }
 
 type machine struct {
-	UUID string
-	Name string
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
 }
 
 func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -80,43 +87,96 @@ func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(fmt.Sprintf("Version: %s\n", buildVersion)))
 }
 
+func (s *managerServer) pollAll() []machine {
+	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	cfgs := []*managerCfg{}
+	for _, opts := range s.cfg.Targets {
+		cfgs = append(cfgs, &opts)
+	}
+	nj := len(cfgs)
+
+	s.log.Debug("Poll started", zap.Int("managers", nj))
+
+	start := time.Now()
+	jobs := make(chan *managerCfg, nj)
+	results := make(chan []machine, nj)
+
+	for i := 0; i < nj; i++ {
+		jobs <- cfgs[i]
+		go s.poll(ctx, jobs, results)
+	}
+	close(jobs)
+
+	var machs []machine
+	for i := 0; i < nj; i++ {
+		machs = append(machs, <-results...)
+	}
+	end := time.Now()
+	s.log.Debug("Poll complete", zap.Int("total_vm_count", len(machs)), zap.Duration("total_duration", end.Sub(start)))
+	return machs
+}
+
+func (s *managerServer) Poller() {
+	for {
+		machs := s.pollAll()
+		s.mu.Lock()
+		s.machs = machs
+		s.mu.Unlock()
+		time.Sleep(pollInterval)
+	}
+}
+
+func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results chan []machine) {
+	opts := <-jobs
+	if opts == nil {
+		s.log.Fatal("No work assigned to worker, this should not happen")
+	}
+	start := time.Now()
+	var machs []machine
+	u := &url.URL{
+		Scheme: "https",
+		User:   url.UserPassword(opts.Username, opts.Password),
+		Host:   opts.Hostname,
+		Path:   "/sdk",
+	}
+
+	c, err := govmomi.NewClient(ctx, u, opts.Insecure)
+	if err != nil {
+		s.log.Error("Failed to connect to vCenter host", zap.String("host", opts.Hostname), zap.Error(err))
+		results <- []machine{}
+		return
+	}
+	// Logout the connection when we are done but do it in the background
+	// TODO: Add event stream to allow for subscribing to events like VM creation
+	// between poll intervals. It would allow us to do a best-effort optimization
+	// to drive down the latencies in the normal case, allowing higher poll intervals.
+	defer func() {
+		go c.Logout(context.Background())
+	}()
+	f := find.NewFinder(c.Client)
+	vms, err := f.VirtualMachineList(ctx, "/...")
+	if err != nil {
+		s.log.Error("Failed to list VMs", zap.String("host", opts.Hostname), zap.Error(err))
+		results <- []machine{}
+		return
+	}
+	for i := range vms {
+		vm := vms[i]
+		machs = append(machs, machine{
+			UUID: vm.UUID(ctx),
+			Name: vm.Name(),
+		})
+	}
+	end := time.Now()
+
+	s.log.Debug("Poll worker complete", zap.String("host", opts.Hostname), zap.Duration("duration", end.Sub(start)), zap.Int("vm_count", len(machs)))
+	results <- machs
+}
+
 func (s *managerServer) MachinesHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// TODO: Cache these and don't do them sequentially
-	ctx, _ := context.WithTimeout(context.Background(), timeout)
-	var machs []machine
-	for host, opts := range s.cfg.Manager {
-		u := &url.URL{
-			Scheme: "https",
-			User:   url.UserPassword(opts.Username, opts.Password),
-			Host:   host,
-			Path:   "/sdk",
-		}
-		c, err := govmomi.NewClient(ctx, u /* insecure= */, false)
-		if err != nil {
-			s.log.Error("Failed to connect to vCenter host", zap.String("host", host), zap.Error(err))
-			continue
-		}
-		// Logout the connection when we are done but do it in the background
-		defer func() {
-			go c.Logout(context.Background())
-		}()
-		f := find.NewFinder(c.Client)
-		vms, err := f.VirtualMachineList(ctx, "/...")
-		if err != nil {
-			s.log.Error("Failed to list VMs", zap.String("host", host), zap.Error(err))
-			continue
-		}
-		for i := range vms {
-			vm := vms[i]
-			machs = append(machs, machine{
-				UUID: vm.UUID(ctx),
-				Name: vm.Name(),
-			})
-		}
-	}
-	js, err := json.Marshal(machs)
+	js, err := json.MarshalIndent(s.machs, "", "  ")
 	if err != nil {
 		s.log.Error("Failed to marshal Machines collection", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -153,6 +213,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	pollInterval, err = time.ParseDuration(*intervalFlag)
+	if err != nil {
+		panic(err)
+	}
 
 	mVersionInfo.With(prometheus.Labels{"version": buildVersion}).Inc()
 	rootlog, err := zap.NewDevelopment()
@@ -175,12 +239,15 @@ func main() {
 	r.HandleFunc("/", srv.StatusHandler).Methods("GET")
 	r.HandleFunc("/v1/machines", srv.MachinesHandler).Methods("GET")
 	r.Handle("/metrics", promhttp.Handler())
+	// TODO: Add boot-installer (https://github.com/vmware/govmomi/blob/1bed5d199a3ad01fb42455993c432349dec99023/govc/device/boot.go#L64)
 
 	go func() {
 		if err := http.ListenAndServe(*listenApi, r); err != nil {
 			rawlog.Fatal("Failed to listen and serve status port", zap.Error(err))
 		}
 	}()
+
+	go srv.Poller()
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)
 

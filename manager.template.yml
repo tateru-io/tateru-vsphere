@@ -1,4 +1,5 @@
-manager:
-        vc.corp.local:
-                username: some-api-user@vsphere.local
-                password: "some-secret-password"
+targets:
+  - hostname: vc.corp.local
+    username: some-api-user@vsphere.local
+    password: "some-secret-password"
+    # insecure: false
