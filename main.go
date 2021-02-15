@@ -321,17 +321,38 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Reset VM
-	t, err = vm.Reset(ctx)
+	// Reset or power-on VM
+	ps, err := vm.PowerState(ctx)
 	if err != nil {
-		s.log.Error("vm.Reset failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reboot failed", http.StatusInternalServerError)
+		s.log.Error("vm.PowerState failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "powerstate unknown", http.StatusInternalServerError)
 		return
 	}
-	if err := t.Wait(ctx); err != nil {
-		s.log.Error("vm.Reset.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reboot failed", http.StatusInternalServerError)
-		return
+
+	if ps == types.VirtualMachinePowerStatePoweredOn {
+		t, err = vm.Reset(ctx)
+		if err != nil {
+			s.log.Error("vm.Reset failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+			http.Error(w, "reboot failed", http.StatusInternalServerError)
+			return
+		}
+		if err := t.Wait(ctx); err != nil {
+			s.log.Error("vm.Reset.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+			http.Error(w, "reboot failed", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		t, err = vm.PowerOn(ctx)
+		if err != nil {
+			s.log.Error("vm.PowerOn failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+			http.Error(w, "power-on failed", http.StatusInternalServerError)
+			return
+		}
+		if err := t.Wait(ctx); err != nil {
+			s.log.Error("vm.PowerOn.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+			http.Error(w, "power-on failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Wait for the VM to reset before resetting the boot sequence
