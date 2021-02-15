@@ -36,6 +36,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/types"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
@@ -88,10 +90,10 @@ type managerServer struct {
 }
 
 type config struct {
-	Targets []managerCfg
+	Targets []target
 }
 
-type managerCfg struct {
+type target struct {
 	Hostname string
 	Username string
 	Password string
@@ -101,6 +103,7 @@ type managerCfg struct {
 type machine struct {
 	UUID string `json:"uuid"`
 	Name string `json:"name"`
+	tgt  *target
 }
 
 func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +114,7 @@ func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *managerServer) pollAll() []machine {
 	ctx, _ := context.WithTimeout(context.Background(), timeout)
-	cfgs := []*managerCfg{}
+	cfgs := []*target{}
 	for _, opts := range s.cfg.Targets {
 		cfgs = append(cfgs, &opts)
 	}
@@ -120,7 +123,7 @@ func (s *managerServer) pollAll() []machine {
 	s.log.Debug("Poll started", zap.Int("managers", nj))
 
 	start := time.Now()
-	jobs := make(chan *managerCfg, nj)
+	jobs := make(chan *target, nj)
 	results := make(chan []machine, nj)
 
 	for i := 0; i < nj; i++ {
@@ -148,26 +151,29 @@ func (s *managerServer) Poller() {
 	}
 }
 
-func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results chan []machine) {
-	opts := <-jobs
-	if opts == nil {
+func connect(ctx context.Context, tgt *target) (*govmomi.Client, error) {
+	u := &url.URL{
+		Scheme: "https",
+		User:   url.UserPassword(tgt.Username, tgt.Password),
+		Host:   tgt.Hostname,
+		Path:   "/sdk",
+	}
+	return govmomi.NewClient(ctx, u, tgt.Insecure)
+}
+
+func (s *managerServer) poll(ctx context.Context, jobs chan *target, results chan []machine) {
+	tgt := <-jobs
+	if tgt == nil {
 		s.log.Fatal("No work assigned to worker, this should not happen")
 	}
 	start := time.Now()
 	var machs []machine
-	u := &url.URL{
-		Scheme: "https",
-		User:   url.UserPassword(opts.Username, opts.Password),
-		Host:   opts.Hostname,
-		Path:   "/sdk",
-	}
-
-	c, err := govmomi.NewClient(ctx, u, opts.Insecure)
+	c, err := connect(ctx, tgt)
 	if err != nil {
-		s.log.Error("Failed to connect to vCenter host", zap.String("host", opts.Hostname), zap.Error(err))
+		s.log.Error("Failed to connect to vCenter host", zap.String("host", tgt.Hostname), zap.Error(err))
 		results <- []machine{}
-		mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(0.0)
-		mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(math.NaN())
+		mPollSuccess.With(prometheus.Labels{"target": tgt.Hostname}).Set(0.0)
+		mPollDuration.With(prometheus.Labels{"target": tgt.Hostname}).Set(math.NaN())
 		return
 	}
 	// Logout the connection when we are done but do it in the background
@@ -180,10 +186,10 @@ func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results
 	f := find.NewFinder(c.Client)
 	vms, err := f.VirtualMachineList(ctx, "/...")
 	if err != nil {
-		s.log.Error("Failed to list VMs", zap.String("host", opts.Hostname), zap.Error(err))
+		s.log.Error("Failed to list VMs", zap.String("host", tgt.Hostname), zap.Error(err))
 		results <- []machine{}
-		mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(0.0)
-		mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(math.NaN())
+		mPollSuccess.With(prometheus.Labels{"target": tgt.Hostname}).Set(0.0)
+		mPollDuration.With(prometheus.Labels{"target": tgt.Hostname}).Set(math.NaN())
 		return
 	}
 	for i := range vms {
@@ -191,14 +197,15 @@ func (s *managerServer) poll(ctx context.Context, jobs chan *managerCfg, results
 		machs = append(machs, machine{
 			UUID: vm.UUID(ctx),
 			Name: vm.Name(),
+			tgt:  tgt,
 		})
 	}
 	end := time.Now()
 
-	mPollSuccess.With(prometheus.Labels{"target": opts.Hostname}).Set(1.0)
-	mPollDuration.With(prometheus.Labels{"target": opts.Hostname}).Set(end.Sub(start).Seconds())
-	mMachines.With(prometheus.Labels{"target": opts.Hostname}).Set(float64(len(machs)))
-	s.log.Debug("Poll worker complete", zap.String("host", opts.Hostname), zap.Duration("duration", end.Sub(start)), zap.Int("vm_count", len(machs)))
+	mPollSuccess.With(prometheus.Labels{"target": tgt.Hostname}).Set(1.0)
+	mPollDuration.With(prometheus.Labels{"target": tgt.Hostname}).Set(end.Sub(start).Seconds())
+	mMachines.With(prometheus.Labels{"target": tgt.Hostname}).Set(float64(len(machs)))
+	s.log.Debug("Poll worker complete", zap.String("host", tgt.Hostname), zap.Duration("duration", end.Sub(start)), zap.Int("vm_count", len(machs)))
 	results <- machs
 }
 
@@ -261,9 +268,93 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// TODO: Add boot-installer (https://github.com/vmware/govmomi/blob/1bed5d199a3ad01fb42455993c432349dec99023/govc/device/boot.go#L64)
+	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	c, err := connect(ctx, m.tgt)
+	if err != nil {
+		s.log.Error("Failed to connect to vCenter host", zap.String("host", m.tgt.Hostname), zap.Error(err))
+		http.Error(w, "target unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() {
+		go c.Logout(context.Background())
+	}()
 
-	http.Error(w, "not implemented yet", http.StatusNotImplemented)
+	si := object.NewSearchIndex(c.Client)
+	ref, err := si.FindByUuid(ctx, nil, m.UUID, true, types.NewBool(false))
+	if err != nil {
+		s.log.Error("FindByUuid failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "FindByUuid failed", http.StatusInternalServerError)
+		return
+	}
+	if ref == nil {
+		s.log.Error("FindByUuid returned nil, VM gone?", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID))
+		http.Error(w, "machine cannot be found anymore", http.StatusNotFound)
+		return
+	}
+	vm := ref.(*object.VirtualMachine)
+
+	devices, err := vm.Device(ctx)
+	if err != nil {
+		s.log.Error("vm.Device failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Set netboot
+	bo := types.VirtualMachineBootOptions{
+		BootOrder: devices.BootOrder([]string{"ethernet"}),
+	}
+	spec := types.VirtualMachineConfigSpec{
+		BootOptions: &bo,
+	}
+
+	t, err := vm.Reconfigure(ctx, spec)
+	if err != nil {
+		s.log.Error("vm.Reconfigure failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := t.Wait(ctx); err != nil {
+		s.log.Error("vm.Reconfigure.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Reset VM
+	t, err = vm.Reset(ctx)
+	if err != nil {
+		s.log.Error("vm.Reset failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reboot failed", http.StatusInternalServerError)
+		return
+	}
+	if err := t.Wait(ctx); err != nil {
+		s.log.Error("vm.Reset.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reboot failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Wait for the VM to reset before resetting the boot sequence
+	// TODO: There might exist some nicer way to see that the machine has booted,
+	// but I could not find one by first glance.
+	time.Sleep(time.Second * 10)
+
+	ctx, _ = context.WithTimeout(context.Background(), timeout)
+	// Set default boot again
+	bo.BootOrder = devices.BootOrder([]string{"-"})
+	t, err = vm.Reconfigure(ctx, spec)
+	if err != nil {
+		s.log.Error("vm.Reconfigure 2nd failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := t.Wait(ctx); err != nil {
+		s.log.Error("vm.Reconfigure.Wait 2nd failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
+		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		return
+	}
+	// All done
 }
 
 func init() {
