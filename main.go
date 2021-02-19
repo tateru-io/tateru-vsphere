@@ -32,6 +32,7 @@ import (
 
 	"github.com/coreos/go-systemd/daemon"
 	"github.com/gorilla/mux"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vmware/govmomi"
@@ -83,10 +84,12 @@ var (
 )
 
 type managerServer struct {
-	mu    sync.RWMutex
-	cfg   *config
-	log   *zap.Logger
-	machs []machine
+	mu        sync.RWMutex
+	cfg       *config
+	log       *zap.Logger
+	machs     []machine
+	opCache   *lru.Cache
+	opUUIDMap sync.Map
 }
 
 type config struct {
@@ -104,6 +107,22 @@ type machine struct {
 	UUID string `json:"uuid"`
 	Name string `json:"name"`
 	tgt  *target
+}
+
+type OpStatus string
+
+const (
+	InstallerOpInProgress       OpStatus = ""
+	InstallerOpOK               OpStatus = "ok"
+	InstallerOpFailed           OpStatus = "failed"
+	InstallerOpFailedConcurrent OpStatus = "failed-concurrent"
+)
+
+type Op struct {
+	m           *machine
+	nonce       string
+	status      OpStatus
+	statusMutex sync.RWMutex
 }
 
 func (s *managerServer) StatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -251,11 +270,24 @@ func (s *managerServer) SpecificMachineHandler(w http.ResponseWriter, r *http.Re
 	w.Write(js)
 }
 
+func (s *managerServer) opCacheEvict(key interface{}, value interface{}) {
+	op := value.(*Op)
+	// Lock on the operation to block the eviction
+	op.statusMutex.RLock()
+	defer op.statusMutex.RUnlock()
+	if op.status == InstallerOpInProgress {
+		// This is bad, this means that some request might end up being executed again
+		// that were just trying to get the status of an already in progress operation.
+		// Fail hard to avoid any damage on the target VMs.
+		s.log.Fatal("Operation was evicted while still running!")
+	}
+	s.log.Debug("Operation evicted from cache", zap.String("uuid", op.m.UUID), zap.String("nonce", op.nonce))
+}
+
 func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	uuid := vars["uuid"]
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var m *machine
 	for _, x := range s.machs {
 		if x.UUID == uuid {
@@ -263,16 +295,72 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 			break
 		}
 	}
+	s.mu.RUnlock()
 	if m == nil {
 		http.NotFound(w, r)
 		return
 	}
 
+	var p struct {
+		Nonce string `json:"nonce"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&p)
+	if err != nil || p.Nonce == "" {
+		http.Error(w, "json: nonce missing from request", http.StatusBadRequest)
+		return
+	}
+
+	op := &Op{
+		m:     m,
+		nonce: p.Nonce,
+	}
+	v, found, _ := s.opCache.PeekOrAdd(uuid+":"+op.nonce, op)
+	if !found {
+		// This was our op that we inserted
+		c := make(chan int)
+		go s.executeInstallerOp(c, op)
+		<-c
+	} else {
+		op = v.(*Op)
+	}
+	op.statusMutex.RLock()
+	defer op.statusMutex.RUnlock()
+	if op.status == InstallerOpOK {
+		// All OK
+		return
+	} else if op.status == InstallerOpFailedConcurrent {
+		http.Error(w, "concurrent operation in progress", http.StatusConflict)
+		return
+	}
+	http.Error(w, "request failed", http.StatusInternalServerError)
+}
+
+func (s *managerServer) executeInstallerOp(ch chan int, op *Op) {
+	m := op.m
+	s.log.Debug("Executing boot installer operation", zap.String("uuid", m.UUID), zap.String("nonce", op.nonce))
+	op.statusMutex.Lock()
+	defer op.statusMutex.Unlock()
+	defer func() {
+		s.log.Info("Boot installer operation completed", zap.String("uuid", m.UUID), zap.String("nonce", op.nonce), zap.String("status", string(op.status)))
+	}()
+	ch <- 1
+
+	_, loaded := s.opUUIDMap.LoadOrStore(m.UUID, ".")
+	if loaded {
+		s.log.Error("Another operation on UUID already running", zap.String("uuid", m.UUID), zap.String("nonce", op.nonce))
+		op.status = InstallerOpFailedConcurrent
+		return
+	}
+
+	defer func() {
+		s.opUUIDMap.Delete(m.UUID)
+	}()
+
 	ctx, _ := context.WithTimeout(context.Background(), timeout)
 	c, err := connect(ctx, m.tgt)
 	if err != nil {
 		s.log.Error("Failed to connect to vCenter host", zap.String("host", m.tgt.Hostname), zap.Error(err))
-		http.Error(w, "target unavailable", http.StatusServiceUnavailable)
+		op.status = InstallerOpFailed
 		return
 	}
 	defer func() {
@@ -283,12 +371,12 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 	ref, err := si.FindByUuid(ctx, nil, m.UUID, true, types.NewBool(false))
 	if err != nil {
 		s.log.Error("FindByUuid failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "FindByUuid failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 	if ref == nil {
 		s.log.Error("FindByUuid returned nil, VM gone?", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID))
-		http.Error(w, "machine cannot be found anymore", http.StatusNotFound)
+		op.status = InstallerOpFailed
 		return
 	}
 	vm := ref.(*object.VirtualMachine)
@@ -296,7 +384,7 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 	devices, err := vm.Device(ctx)
 	if err != nil {
 		s.log.Error("vm.Device failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 
@@ -311,13 +399,13 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 	t, err := vm.Reconfigure(ctx, spec)
 	if err != nil {
 		s.log.Error("vm.Reconfigure failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 
 	if err := t.Wait(ctx); err != nil {
 		s.log.Error("vm.Reconfigure.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 
@@ -325,7 +413,7 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 	ps, err := vm.PowerState(ctx)
 	if err != nil {
 		s.log.Error("vm.PowerState failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "powerstate unknown", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 
@@ -333,24 +421,24 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 		t, err = vm.Reset(ctx)
 		if err != nil {
 			s.log.Error("vm.Reset failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-			http.Error(w, "reboot failed", http.StatusInternalServerError)
+			op.status = InstallerOpFailed
 			return
 		}
 		if err := t.Wait(ctx); err != nil {
 			s.log.Error("vm.Reset.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-			http.Error(w, "reboot failed", http.StatusInternalServerError)
+			op.status = InstallerOpFailed
 			return
 		}
 	} else {
 		t, err = vm.PowerOn(ctx)
 		if err != nil {
 			s.log.Error("vm.PowerOn failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-			http.Error(w, "power-on failed", http.StatusInternalServerError)
+			op.status = InstallerOpFailed
 			return
 		}
 		if err := t.Wait(ctx); err != nil {
 			s.log.Error("vm.PowerOn.Wait failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-			http.Error(w, "power-on failed", http.StatusInternalServerError)
+			op.status = InstallerOpFailed
 			return
 		}
 	}
@@ -366,16 +454,17 @@ func (s *managerServer) BootInstallerHandler(w http.ResponseWriter, r *http.Requ
 	t, err = vm.Reconfigure(ctx, spec)
 	if err != nil {
 		s.log.Error("vm.Reconfigure 2nd failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 
 	if err := t.Wait(ctx); err != nil {
 		s.log.Error("vm.Reconfigure.Wait 2nd failed", zap.String("host", m.tgt.Hostname), zap.String("uuid", m.UUID), zap.Error(err))
-		http.Error(w, "reconfigure failed", http.StatusInternalServerError)
+		op.status = InstallerOpFailed
 		return
 	}
 	// All done
+	op.status = InstallerOpOK
 }
 
 func init() {
@@ -427,6 +516,10 @@ func main() {
 	srv := &managerServer{log: rawlog}
 	if err := srv.loadConfig(*confFile); err != nil {
 		rawlog.Fatal("Failed to load configuration file", zap.String("file", *confFile), zap.Error(err))
+	}
+	srv.opCache, err = lru.NewWithEvict(128, srv.opCacheEvict)
+	if err != nil {
+		rawlog.Fatal("Failed to initialize operations cache", zap.Error(err))
 	}
 
 	r := mux.NewRouter()
